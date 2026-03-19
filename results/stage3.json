@@ -1,0 +1,127 @@
+{
+  "best_code": "import re, math\nfrom collections import Counter\nfrom typing import Optional, List, Tuple\nimport sympy as sp\n\n# ----------------- parsing helpers -----------------\n\n_ANS_RE = re.compile(r\"<answer>\\s*([-+]?\\d+)\\s*</answer>\", re.IGNORECASE)\n\ndef _extract_answer_int(text: str) -> Optional[int]:\n    if not text:\n        return None\n    m = _ANS_RE.search(text)\n    if not m:\n        return None\n    try:\n        return int(m.group(1))\n    except Exception:\n        return None\n\ndef _normalize_aime(v: Optional[int]) -> Optional[int]:\n    if v is None:\n        return None\n    if 0 <= v <= 999:\n        return v\n    return None\n\ndef _majority(counter: Counter) -> Tuple[Optional[int], int, int, int]:\n    if not counter:\n        return None, 0, 0, 0\n    (a1, c1), *rest = counter.most_common()\n    c2 = rest[0][1] if rest else 0\n    total = sum(counter.values())\n    return a1, c1, c2, total\n\ndef _gcd_all(ints: List[int]) -> int:\n    g = 0\n    for x in ints:\n        g = math.gcd(g, abs(int(x)))\n    return g\n\n# ----------------- prompt builders -----------------\n\ndef _base_prompt(problem_text: str) -> str:\n    return (\n        \"Solve the following AIME problem. Show clear step-by-step reasoning, do careful arithmetic, \"\n        \"and put the final answer as an integer in <answer>...</answer> tags.\\n\\n\"\n        f\"Problem: {problem_text}\\n\"\n    )\n\ndef _alt_prompt(problem_text: str, style: str) -> str:\n    # Different \u201cangles\u201d help a small model escape local mistakes.\n    if style == \"algebra\":\n        extra = (\n            \"Prefer algebraic derivations and invariants. Keep expressions symbolic as long as possible. \"\n            \"Only do arithmetic at the end and double-check it.\"\n        )\n    elif style == \"counting\":\n        extra = (\n            \"If this is counting/probability, define the sample space carefully, use complementary counting, \"\n            \"and sanity-check with small cases.\"\n        )\n    elif style == \"geometry\":\n        extra = (\n            \"If this is geometry, introduce coordinates or vectors if helpful, track units, and verify with \"\n            \"a quick consistency check.\"\n        )\n    else:  # \"checklist\"\n        extra = (\n            \"Use a verification checklist: (1) restate variables, (2) derive key equations, (3) solve, \"\n            \"(4) check constraints, (5) re-check arithmetic.\"\n        )\n    return (\n        \"Solve the following AIME problem. \" + extra + \"\\n\"\n        \"Put the final answer as an integer in <answer>...</answer> tags.\\n\\n\"\n        f\"Problem: {problem_text}\\n\"\n    )\n\ndef _verify_prompt(problem_text: str, candidate: int) -> str:\n    return (\n        \"Solve the following AIME problem. A candidate final answer is given.\\n\"\n        \"Task: Verify the candidate by re-solving cleanly and checking computations. \"\n        \"If the candidate is wrong, give the correct integer answer.\\n\"\n        \"Put ONLY the final integer in <answer>...</answer> tags.\\n\\n\"\n        f\"Problem: {problem_text}\\n\\n\"\n        f\"Candidate answer to verify: {candidate}\\n\"\n    )\n\ndef _choose_prompt(problem_text: str, candidates: List[int]) -> str:\n    cand_str = \", \".join(map(str, candidates))\n    return (\n        \"Solve the following AIME problem. Several candidate answers are listed.\\n\"\n        \"Task: Determine which candidate is correct by checking each quickly (plug-in, bounds, parity, \"\n        \"recompute key steps). If none are correct, compute the correct answer.\\n\"\n        \"Return ONLY one integer in <answer>...</answer> tags.\\n\\n\"\n        f\"Problem: {problem_text}\\n\\n\"\n        f\"Candidates: {cand_str}\\n\"\n    )\n\n# ----------------- sympy salvage (lightweight) -----------------\n\n_INT_RE = re.compile(r\"(?<![A-Za-z])[-+]?\\d+(?![A-Za-z])\")\n\ndef _attempt_sympy_salvage(problem_text: str, candidates: List[int]) -> Optional[int]:\n    \"\"\"\n    Very conservative salvage: if the problem likely asks for gcd/lcm or a linear/quad numeric result,\n    try to compute from integers appearing in the statement.\n    This is intentionally minimal to avoid hallucinated parsing.\n    \"\"\"\n    nums = [int(x) for x in _INT_RE.findall(problem_text)]\n    if not nums:\n        return None\n\n    low = problem_text.lower()\n    # gcd-type questions\n    if \"gcd\" in low or \"greatest common divisor\" in low:\n        g = _gcd_all(nums)\n        if 0 <= g <= 999:\n            return g\n    # lcm-type questions (careful: can explode)\n    if \"lcm\" in low or \"least common multiple\" in low:\n        l = 1\n        for x in nums:\n            l = abs(l * x) // math.gcd(l, x) if x != 0 else l\n            if l > 10**6:\n                break\n        if 0 <= l <= 999:\n            return l\n\n    # If candidates exist and the statement contains a modulus-like request, prefer mod reduction.\n    if (\"mod\" in low or \"remainder\" in low) and candidates:\n        # Often AIME asks for remainder mod something; we can't reliably parse modulus, so skip.\n        return None\n\n    return None\n\n# ----------------- main solver -----------------\n\ndef solve(problem_text: str, call_model, call_model_n) -> int | None:\n    \"\"\"\n    Budget-aware strategy (~<=40 total calls):\n      1) 20-sample base prompt; vote.\n      2) If strong majority, verify with 5 calls.\n      3) If weak, do 8 calls with alternate styles; combine votes.\n      4) Ask chooser among top candidates (6 calls).\n      5) Final verify (3 calls).\n      6) Optional conservative sympy salvage for gcd/lcm-like statements.\n    \"\"\"\n    # ---- Batch 1: initial sampling (20) ----\n    base = _base_prompt(problem_text)\n    comps = call_model_n(base, n=20)\n    ans = [_normalize_aime(_extract_answer_int(t)) for t in comps]\n    counter = Counter(a for a in ans if a is not None)\n\n    if not counter:\n        # One extra attempt with checklist\n        t = call_model(_alt_prompt(problem_text, \"checklist\"))\n        return _normalize_aime(_extract_answer_int(t))\n\n    top, c1, c2, total = _majority(counter)\n\n    # Strong majority heuristic\n    strong = (c1 >= 11) or (c1 >= 9 and c1 >= c2 + 5) or (c1 / max(1, total) >= 0.6)\n\n    # ---- If strong: verify (5) ----\n    if strong and top is not None:\n        ver = call_model_n(_verify_prompt(problem_text, top), n=5)\n        vans = [_normalize_aime(_extract_answer_int(t)) for t in ver]\n        vcounter = Counter(a for a in vans if a is not None)\n        if vcounter:\n            vtop, vc1, vc2, vtotal = _majority(vcounter)\n            # accept if verification supports it\n            if vtop == top and vc1 >= 2:\n                return top\n            # switch if verification strongly disagrees\n            if vc1 >= 3 and vtop is not None:\n                return vtop\n        return top\n\n    # ---- Weak: diversify prompts (8) ----\n    # These extra \"angles\" often fix arithmetic/approach errors in 7B.\n    styles = [\"algebra\", \"counting\", \"geometry\", \"checklist\"]\n    # 8 calls total: 2 per style\n    alt_prompts = [_alt_prompt(problem_text, s) for s in styles for _ in range(2)]\n    # call_model_n takes one prompt; so we do 4 small batches of 2 to keep within API assumptions.\n    alt_answers: List[Optional[int]] = []\n    for s in styles:\n        alt_comps = call_model_n(_alt_prompt(problem_text, s), n=2)\n        alt_answers.extend(_normalize_aime(_extract_answer_int(t)) for t in alt_comps)\n\n    alt_counter = Counter(a for a in alt_answers if a is not None)\n\n    # Combine: base counts + 1.5x alt counts (implemented as +2 then -0.5 not possible; use +2 and later thresholds)\n    combined = Counter(counter)\n    for a, k in alt_counter.items():\n        combined[a] += 2 * k\n\n    # If still too flat, prepare candidate list from combined\n    final0, fc1, fc2, ftotal = _majority(combined)\n    if final0 is None:\n        # last resort: sympy salvage\n        return _attempt_sympy_salvage(problem_text, [])\n\n    # If combined now has a clear leader, go straight to verify\n    clearer = (fc1 >= fc2 + 4) or (fc1 >= 9)\n    if clearer:\n        ver2 = call_model_n(_verify_prompt(problem_text, final0), n=3)\n        v2 = [_normalize_aime(_extract_answer_int(t)) for t in ver2]\n        v2c = Counter(a for a in v2 if a is not None)\n        if v2c:\n            v2top, v2c1, v2c2, _ = _majority(v2c)\n            if v2top == final0 and v2c1 >= 2:\n                return final0\n            if v2c1 >= 2 and v2top is not None:\n                return v2top\n        return final0\n\n    # ---- Chooser among top candidates (6) ----\n    top_candidates = [a for a, _ in combined.most_common(6)]\n    # Ensure at least 3 candidates for better discrimination\n    top_candidates = [x for x in top_candidates if x is not None]\n    if len(top_candidates) < 3:\n        # pad from base\n        for a, _ in counter.most_common(6):\n            if a is not None and a not in top_candidates:\n                top_candidates.append(a)\n            if len(top_candidates) >= 3:\n                break\n    if not top_candidates:\n        return _attempt_sympy_salvage(problem_text, [])\n\n    choose_comps = call_model_n(_choose_prompt(problem_text, top_candidates[:6]), n=6)\n    choose_ans = [_normalize_aime(_extract_answer_int(t)) for t in choose_comps]\n    choose_counter = Counter(a for a in choose_ans if a is not None)\n\n    # Merge chooser evidence with heavier weight\n    merged = Counter(combined)\n    for a, k in choose_counter.items():\n        merged[a] += 3 * k\n\n    final, mc1, mc2, mtotal = _majority(merged)\n    if final is None:\n        return _attempt_sympy_salvage(problem_text, top_candidates)\n\n    # ---- Final verification (3) ----\n    ver3 = call_model_n(_verify_prompt(problem_text, final), n=3)\n    v3 = [_normalize_aime(_extract_answer_int(t)) for t in ver3]\n    v3c = Counter(a for a in v3 if a is not None)\n    if v3c:\n        v3top, v3c1, v3c2, _ = _majority(v3c)\n        if v3top == final and v3c1 >= 2:\n            return final\n        if v3c1 >= 2 and v3top is not None:\n            return v3top\n\n    # ---- Optional conservative salvage if result looks suspiciously low-support ----\n    if mc1 <= 3:\n        salv = _attempt_sympy_salvage(problem_text, top_candidates)\n        if salv is not None:\n            return salv\n\n    return final",
+  "best_train_score": 0.26666666666666666,
+  "test_results": [
+    {
+      "id": "2024_II_1",
+      "expected": 73,
+      "selected": 113,
+      "pass_at_1": 0.0,
+      "correct": 0,
+      "total": 1
+    },
+    {
+      "id": "2024_II_2",
+      "expected": 236,
+      "selected": 236,
+      "pass_at_1": 1.0,
+      "correct": 1,
+      "total": 1
+    },
+    {
+      "id": "2024_II_3",
+      "expected": 45,
+      "selected": 0,
+      "pass_at_1": 0.0,
+      "correct": 0,
+      "total": 1
+    },
+    {
+      "id": "2024_II_4",
+      "expected": 33,
+      "selected": 33,
+      "pass_at_1": 1.0,
+      "correct": 1,
+      "total": 1
+    },
+    {
+      "id": "2024_II_5",
+      "expected": 80,
+      "selected": 120,
+      "pass_at_1": 0.0,
+      "correct": 0,
+      "total": 1
+    },
+    {
+      "id": "2024_II_6",
+      "expected": 55,
+      "selected": 66,
+      "pass_at_1": 0.0,
+      "correct": 0,
+      "total": 1
+    },
+    {
+      "id": "2024_II_7",
+      "expected": 699,
+      "selected": 959,
+      "pass_at_1": 0.0,
+      "correct": 0,
+      "total": 1
+    },
+    {
+      "id": "2024_II_8",
+      "expected": 127,
+      "selected": 7,
+      "pass_at_1": 0.0,
+      "correct": 0,
+      "total": 1
+    },
+    {
+      "id": "2024_II_9",
+      "expected": 902,
+      "selected": 32,
+      "pass_at_1": 0.0,
+      "correct": 0,
+      "total": 1
+    },
+    {
+      "id": "2024_II_10",
+      "expected": 468,
+      "selected": 156,
+      "pass_at_1": 0.0,
+      "correct": 0,
+      "total": 1
+    },
+    {
+      "id": "2024_II_11",
+      "expected": 601,
+      "selected": 1,
+      "pass_at_1": 0.0,
+      "correct": 0,
+      "total": 1
+    },
+    {
+      "id": "2024_II_12",
+      "expected": 23,
+      "selected": 13,
+      "pass_at_1": 0.0,
+      "correct": 0,
+      "total": 1
+    },
+    {
+      "id": "2024_II_13",
+      "expected": 321,
+      "selected": 496,
+      "pass_at_1": 0.0,
+      "correct": 0,
+      "total": 1
+    },
+    {
+      "id": "2024_II_14",
+      "expected": 211,
+      "selected": 10,
+      "pass_at_1": 0.0,
+      "correct": 0,
+      "total": 1
+    },
+    {
+      "id": "2024_II_15",
+      "expected": 315,
+      "selected": 60,
+      "pass_at_1": 0.0,
+      "correct": 0,
+      "total": 1
+    }
+  ],
+  "test_avg": 0.13333333333333333
+}
